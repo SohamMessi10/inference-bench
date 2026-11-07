@@ -6,9 +6,8 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from inferbench.loadgen import LoadConfig, Record, Run
-from inferbench.metrics import (
-    PERCENTILES, TAIL_SAMPLES, percentile, reliable_percentile, run_metrics, samples_needed,
-)
+from inferbench.metrics import run_metrics
+from inferbench.percentiles import PERCENTILES, TAIL_SAMPLES, percentile, reliable_percentile, samples_needed
 from inferbench.report import as_markdown, as_text
 
 
@@ -110,3 +109,18 @@ def test_markdown_report_is_a_table():
     assert lines[0].startswith("| run | model |") and lines[1].startswith("|---|---|---:|")
     assert lines[2].startswith("| run-1 | digits-small |")
     assert all(line.count("|") == lines[0].count("|") for line in lines[:3])
+
+
+def test_report_warns_when_the_load_generator_was_overloaded():
+    from dataclasses import replace
+
+    base = run_metrics(make_run([40.0] * 30), "r")
+    busy, calm, small = replace(base, client_lag_p99=30.0), replace(base, client_lag_p99=1.0), replace(base, client_lag_p99=3.5)
+    assert "the load generator itself was overloaded" in as_text([busy])
+    assert "overloaded" not in as_text([calm])
+    assert "overloaded" not in as_text([small])  # 3.5 ms is under 5 ms and under 10% of 40 ms (4 ms)
+    # Both conditions are needed: over 5 ms, and over 10% of the median.
+    assert "overloaded" not in as_text([replace(run_metrics(make_run([2.6] * 30), "r"), client_lag_p99=1.5)])
+    assert "overloaded" not in as_text([replace(run_metrics(make_run([200.0] * 30), "r"), client_lag_p99=8.0)])
+    assert "overloaded" in as_text([replace(run_metrics(make_run([50.0] * 30), "r"), client_lag_p99=8.0)])
+    assert "30.00" in as_text([busy])  # the column

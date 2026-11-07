@@ -240,3 +240,36 @@ def test_summary_numbers_can_be_recomputed_from_the_records():
     assert s["requests"] == len(measured)
     assert s["ok_per_second"] == round(sum(r.ok for r in measured) / run.measured_seconds, 1)
     assert s["images_per_second"] == round(sum(r.images for r in measured if r.ok) / run.measured_seconds, 1)
+
+
+def test_client_loop_lag_is_measured_and_saved(tmp_path):
+    with Served(synthetic(fixed_ms=2)) as served:
+        run = load(url=served.url, concurrency=2, duration=0.5, warmup=0.1)
+    lag = run.loop_lag
+    assert lag["samples"] > 50 and 0 <= lag["p50_ms"] <= lag["p99_ms"] <= lag["max_ms"]
+    path = tmp_path / "r.jsonl"
+    write_results(run, path)
+    assert read_results(path).loop_lag == lag
+
+
+def test_answers_read_after_the_limit_are_late_and_the_lag_shows_why():
+    # Something else in the client's process hogs its event loop for 80 ms at a time. Answers
+    # from a fast server then sit ready but are read after the 50 ms limit: they count as
+    # "late", not as successes, and the measured loop lag explains it.
+    async def main(url):
+        async def hog():
+            await asyncio.sleep(0.2)  # after the load generator's first request to the server
+            for _ in range(8):
+                time.sleep(0.08)          # blocks the event loop, as an overloaded client would
+                await asyncio.sleep(0.02)
+
+        result, _ = await asyncio.gather(run_load(LoadConfig(url=url, concurrency=4, duration=1.0, warmup=0,
+                                                             timeout=0.05)), hog())
+        return result
+
+    with Served(synthetic(fixed_ms=1)) as served:
+        run = asyncio.run(main(served.url))
+    late = [r for r in run.measured() if r.error == "late"]
+    assert late and all(r.status == 200 and r.latency_ms > 50 for r in late)
+    assert all(r.latency_ms <= 50 for r in run.measured() if r.ok)  # nothing slower than the limit counts as ok
+    assert run.loop_lag["max_ms"] >= 60

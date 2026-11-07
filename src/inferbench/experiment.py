@@ -9,6 +9,9 @@ reprocessed later, and the conclusion is computed from the numbers, whichever wa
 from __future__ import annotations
 
 import asyncio
+import json
+import time
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -132,3 +135,116 @@ def render(config: ExperimentConfig, results: dict[str, list[RunMetrics]]) -> st
     out += ["", "## What it shows", ""] + [f"- {line}" for line in conclusion(rows)]
     out += ["", "## Every run", "", as_markdown(results["off"] + results["on"])]
     return "\n".join(out)
+
+
+# --- the overload experiment ---------------------------------------------------------------
+
+@dataclass(frozen=True)
+class OverloadConfig:
+    """Heavy load with impatient clients, against a server with and without protections.
+
+    The defaults overload the *server* without overloading the *client*: a slow model (a
+    synthetic one that takes 20 ms a call) on 2 threads can answer about 100 requests a second,
+    and 16 clients want more than that. An earlier version used 64 clients against the fast
+    digits-large model on a 2-CPU machine; the load generator itself was then so overloaded
+    that its numbers measured mostly its own delay (see docs/overload.md).
+    """
+
+    model: str = "synthetic"
+    concurrency: int = 16
+    duration: float = 5.0
+    warmup: float = 1.0
+    threads: int = 2
+    client_timeout: float = 0.1   # clients give up after 100 ms
+    max_waiting: int = 4
+    deadline_ms: float = 60.0
+    backoff_ms: float = 20.0      # a refused client waits this long before sending again, in every mode
+    fixed_ms: float = 20.0
+    per_item_ms: float = 0.0
+
+    def modes(self) -> list[tuple[str, list[str]]]:
+        queue = ["--max-waiting", str(self.max_waiting)]
+        deadline = ["--deadline-ms", str(self.deadline_ms)]
+        return [("no limits", []), (f"at most {self.max_waiting} waiting", queue),
+                (f"{self.deadline_ms:g} ms deadline", deadline), ("both", queue + deadline)]
+
+    def server_args(self, extra: list[str]) -> list[str]:
+        args = ["--model", self.model, "--threads", str(self.threads), *extra]
+        if self.model == "synthetic":
+            args += ["--fixed-ms", str(self.fixed_ms), "--per-item-ms", str(self.per_item_ms)]
+        return args
+
+
+def _server_stats(url: str) -> dict:
+    with urllib.request.urlopen(f"{url}/v1/stats", timeout=10) as response:
+        return json.load(response)
+
+
+def run_overload(config: OverloadConfig, models_dir: Path, out_dir: Path | None = None,
+                 progress=print) -> tuple[Path, list[dict]]:
+    out_dir = out_dir or Path("results") / f"overload-{config.model}-{datetime.now():%Y%m%d-%H%M%S}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for index, (label, extra) in enumerate(config.modes()):
+        progress(f"{label} ...")
+        with ServerProcess(*config.server_args(extra), models_dir=models_dir) as server:
+            before = _server_stats(server.url)
+            run = asyncio.run(run_load(LoadConfig(url=server.url, concurrency=config.concurrency,
+                                                  duration=config.duration, warmup=config.warmup,
+                                                  timeout=config.client_timeout, backoff_ms=config.backoff_ms)))
+            # Let answers to clients that already gave up finish, so the server's count is complete.
+            time.sleep(0.5)
+            after = _server_stats(server.url)
+        write_results(run, out_dir / f"mode{index}.jsonl")
+        m = run_metrics(run, label)
+        computed = after["answered"] - before["answered"]
+        received = sum(r.ok for r in run.records)  # every phase: the server's count covers them all
+        rows.append({
+            "mode": label, "ok_per_second": m.ok_per_second, "p50": m.latency[50], "p99": m.latency[99],
+            "requests": m.requests, "ok": m.ok, "errors": m.errors,
+            "server_answered": computed, "client_received": received,
+            "wasted": max(computed - received, 0),
+            "refused_busy": after["refused_busy"] - before["refused_busy"],
+            "refused_deadline": after["refused_deadline"] - before["refused_deadline"],
+            "client_lag_p99": m.client_lag_p99,
+        })
+    (out_dir / "report.md").write_text(render_overload(config, rows), encoding="utf-8")
+    return out_dir, rows
+
+
+def overload_conclusion(rows: list[dict]) -> list[str]:
+    best = max(rows, key=lambda r: r["ok_per_second"])
+    lines = [f"Most useful answers per second: {best['mode']} ({best['ok_per_second']:.1f}/s)."]
+    for r in rows:
+        computed = r["server_answered"]
+        share = r["wasted"] / computed if computed else 0.0
+        lines.append(f"{r['mode']}: {r['ok']} of {r['requests']} measured requests answered in time; the server "
+                     f"computed {computed} answers and {r['wasted']} ({share:.0%}) reached nobody, because the "
+                     f"client had already given up.")
+    return lines
+
+
+def render_overload(config: OverloadConfig, rows: list[dict]) -> str:
+    def ms(v):
+        return "-" if v is None else f"{v:.2f}"
+
+    def errors(r):
+        return ", ".join(f"{k}: {v}" for k, v in sorted(r["errors"].items())) or "none"
+
+    out = [
+        f"# Overload experiment: {config.model}",
+        "",
+        f"{config.concurrency} workers, closed loop, clients give up after {config.client_timeout * 1000:g} ms; "
+        f"{config.threads} model threads; {config.warmup:g} s warmup and {config.duration:g} s measured per mode. "
+        f"A refused client waits {config.backoff_ms:g} ms before sending again, in every mode. 'late' answers "
+        "came after the client's limit. Client lag is how late the load generator's own event loop ran (p99); "
+        "if it is large, the client, not the server, was the bottleneck.",
+        "",
+        "| Server | Answered in time /s | p50 ms | p99 ms | Failed requests | Server computed | Reached nobody | Client lag p99 ms |",
+        "|---|---:|---:|---:|---|---:|---:|---:|",
+    ]
+    for r in rows:
+        out.append(f"| {r['mode']} | {r['ok_per_second']:.1f} | {ms(r['p50'])} | {ms(r['p99'])} | {errors(r)} | "
+                   f"{r['server_answered']} | {r['wasted']} | {ms(r.get('client_lag_p99'))} |")
+    out += ["", "## What it shows", ""] + [f"- {line}" for line in overload_conclusion(rows)]
+    return "\n".join(out) + "\n"

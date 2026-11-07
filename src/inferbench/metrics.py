@@ -13,44 +13,11 @@ precise and isn't.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from fractions import Fraction
 
 from inferbench.loadgen import Run
 
-TAIL_SAMPLES = 10
-PERCENTILES = (50, 95, 99)
-
-
-def _exact(p: float) -> Fraction:
-    # Percentiles are written as decimals (95, 99.9). In floating point 1 - 99.9/100 isn't
-    # exactly 0.001, which once made p99.9 ask for 10,001 samples instead of 10,000; working
-    # with the decimal as written avoids that.
-    return Fraction(str(p))
-
-
-def samples_needed(p: float) -> int:
-    """The smallest n with at least TAIL_SAMPLES values above the p-th percentile."""
-    if not 0 < p < 100:
-        raise ValueError(f"percentile must be between 0 and 100, got {p}")
-    return math.ceil(TAIL_SAMPLES / (1 - _exact(p) / 100))
-
-
-def percentile(values: list[float], p: float) -> float:
-    """Nearest-rank percentile of a non-empty list."""
-    if not values:
-        raise ValueError("no values")
-    if not 0 < p <= 100:
-        raise ValueError(f"percentile must be in (0, 100], got {p}")
-    ordered = sorted(values)
-    rank = math.ceil(_exact(p) / 100 * len(ordered))  # exact, so 95% of 200 is 190, not 191
-    return ordered[max(rank, 1) - 1]
-
-
-def reliable_percentile(values: list[float], p: float) -> float | None:
-    """The percentile, or None when there are too few values to support it."""
-    return percentile(values, p) if len(values) >= samples_needed(p) else None
+from inferbench.percentiles import PERCENTILES, reliable_percentile
 
 
 @dataclass(frozen=True)
@@ -77,6 +44,7 @@ class RunMetrics:
     first_ms: float | None     # the run's first request, sent on its own
     accuracy: float | None
     machine: dict
+    client_lag_p99: float | None = None  # how late the load generator's own event loop ran (ms)
 
     @property
     def error_rate(self) -> float:
@@ -120,5 +88,6 @@ def run_metrics(run: Run, name: str = "") -> RunMetrics:
         first_ms=first.latency_ms if first is not None and first.ok else None,
         accuracy=(sum(r.correct for r in answered) / sum(r.images for r in answered)) if answered else None,
         machine=run.machine,
+        client_lag_p99=run.loop_lag.get("p99_ms") if run.loop_lag else None,
     )
 

@@ -12,6 +12,7 @@ the cost of each batch size easy to reason about.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -169,6 +170,36 @@ class SyntheticModel(Model):
         batch = np.asarray(batch, dtype=np.float32)
         time.sleep((self.fixed_ms + self.per_item_ms * len(batch)) / 1000)
         return (batch.sum(axis=1).astype(np.int64)) % 10
+
+
+class InjectedFailure(RuntimeError):
+    """A failure FlakyModel raised on purpose."""
+
+
+class FlakyModel(Model):
+    """Wraps a model and makes a fraction of its calls fail, for testing error handling.
+
+    Failures come from a seeded random generator, so a run with the same calls in the same order
+    fails the same calls. The wrapped model's description says it is failing on purpose.
+    """
+
+    def __init__(self, model: Model, fail_rate: float, seed: int = 0):
+        if not 0 <= fail_rate <= 1:
+            raise ModelError(f"fail_rate must be between 0 and 1, got {fail_rate}")
+        self.model, self.fail_rate = model, fail_rate
+        self.rng = np.random.default_rng(seed)
+        self.lock = threading.Lock()  # several model threads call predict; numpy's generator isn't thread-safe
+        info = model.info
+        self.info = ModelInfo(info.name, info.kind, info.input_size,
+                              f"{info.description} (failing {fail_rate:.0%} of calls on purpose)",
+                              {**info.details, "injected_fail_rate": fail_rate})
+
+    def predict(self, batch: np.ndarray) -> np.ndarray:
+        with self.lock:
+            fail = self.rng.random() < self.fail_rate
+        if fail:
+            raise InjectedFailure("injected failure")
+        return self.model.predict(batch)
 
 
 def load_model(name: str, models_dir: Path, **synthetic) -> Model:

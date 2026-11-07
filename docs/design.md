@@ -145,5 +145,6 @@ README.
 3. Metrics and report: percentiles with sample-size rules, cold start, hardware, comparison. *(complete)*
 4. Batching experiment: a dynamic batcher in the server and the experiment across concurrency. *(complete:
    results in [`batching.md`](batching.md))*
-5. Overload and failure: a bounded queue (503), client timeouts, injected server errors.
+5. Overload and failure: a bounded queue (503), client timeouts, injected server errors. *(complete:
+   results in [`overload.md`](overload.md))*
 6. Methodology write-up, README, resume material.

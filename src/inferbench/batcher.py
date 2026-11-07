@@ -42,11 +42,16 @@ class BatchSettings:
             raise ValueError(f"workers must be between 1 and 64, got {self.workers}")
 
 
+class DeadlineExceeded(Exception):
+    """A request waited longer than its deadline, so it was dropped instead of run."""
+
+
 @dataclass
 class _Item:
     images: np.ndarray
     arrived: float
     done: asyncio.Future
+    expires: float | None = None  # perf_counter time after which running it is pointless
 
 
 @dataclass(frozen=True)
@@ -78,18 +83,33 @@ class DynamicBatcher:
             if not item.done.done():
                 item.done.set_exception(RuntimeError("the server is shutting down"))
 
-    async def predict(self, images: np.ndarray) -> BatchResult:
+    async def predict(self, images: np.ndarray, *, arrived: float | None = None,
+                      deadline_s: float | None = None) -> BatchResult:
+        """Queue images for the next batch. With `deadline_s`, a request still waiting that long
+        after `arrived` is dropped with DeadlineExceeded rather than run."""
         if len(images) > self.settings.max_images:
             raise ValueError(f"a request of {len(images)} images can't fit a batch of {self.settings.max_images}")
-        item = _Item(images, time.perf_counter(), asyncio.get_running_loop().create_future())
+        arrived = time.perf_counter() if arrived is None else arrived
+        item = _Item(images, arrived, asyncio.get_running_loop().create_future(),
+                     None if deadline_s is None else arrived + deadline_s)
         await self.queue.put(item)
         return await item.done
+
+    @staticmethod
+    def _expired(item: _Item) -> bool:
+        if item.expires is not None and time.perf_counter() > item.expires:
+            if not item.done.done():
+                item.done.set_exception(DeadlineExceeded())
+            return True
+        return False
 
     async def _worker(self) -> None:
         carried: _Item | None = None  # a request that didn't fit the previous batch
         while True:
             first = carried or await self.queue.get()
             carried = None
+            if self._expired(first):
+                continue
             batch, images = [first], len(first.images)
             deadline = first.arrived + self.settings.max_wait_ms / 1000
             while images < self.settings.max_images:
@@ -98,6 +118,8 @@ class DynamicBatcher:
                     item = self.queue.get_nowait() if remaining <= 0 else await asyncio.wait_for(self.queue.get(), remaining)
                 except (asyncio.QueueEmpty, TimeoutError):
                     break
+                if self._expired(item):
+                    continue
                 if images + len(item.images) > self.settings.max_images:
                     carried = item  # starts the next batch instead of overfilling this one
                     break

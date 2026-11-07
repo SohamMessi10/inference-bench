@@ -7,10 +7,24 @@ behind the percentiles, and the machines the runs came from.
 
 from __future__ import annotations
 
-from inferbench.metrics import PERCENTILES, RunMetrics, samples_needed
+from inferbench.metrics import RunMetrics
+from inferbench.percentiles import PERCENTILES, samples_needed
 
 COLUMNS = ["run", "model", "threads", "workers", "images", "ok", "failed", "req/s", "images/s",
-           "p50 ms", "p95 ms", "p99 ms", "wait ms", "model ms", "other ms", "first ms"]
+           "p50 ms", "p95 ms", "p99 ms", "wait ms", "model ms", "other ms", "first ms", "client lag p99"]
+
+# The load generator counts as overloaded when its event loop ran at least this late at p99
+# AND later than this share of the median latency: then a noticeable part of "latency" is the
+# client's own delay. (With "or", every run warned, even 1.5 ms of lag at one worker.)
+CLIENT_LAG_MS = 5.0
+CLIENT_LAG_SHARE = 0.10
+
+
+def client_overloaded(m: RunMetrics) -> bool:
+    if m.client_lag_p99 is None:
+        return False
+    median = m.latency[50] or m.mean_ms or 0.0
+    return m.client_lag_p99 > CLIENT_LAG_MS and m.client_lag_p99 > CLIENT_LAG_SHARE * median
 
 
 def _ms(value: float | None) -> str:
@@ -30,7 +44,7 @@ def row(m: RunMetrics) -> list[str]:
     return [m.name, model, str(m.threads) if m.threads else "?", str(m.workers), str(m.images), str(m.ok), failed,
             f"{m.ok_per_second:.1f}", f"{m.images_per_second:.1f}",
             *(_percentile(m, p) for p in PERCENTILES),
-            _ms(m.wait_ms), _ms(m.model_ms), _ms(m.other_ms), _ms(m.first_ms)]
+            _ms(m.wait_ms), _ms(m.model_ms), _ms(m.other_ms), _ms(m.first_ms), _ms(m.client_lag_p99)]
 
 
 def notes(runs: list[RunMetrics]) -> list[str]:
@@ -42,7 +56,14 @@ def notes(runs: list[RunMetrics]) -> list[str]:
         "Latency counts successful requests only; failures are counted separately and never dropped.",
         "wait = in the server before the model ran; model = in the model; other = the rest of the "
         "round trip (HTTP, JSON, the event loop). first = the run's first request, sent on its own.",
+        "client lag = how late the load generator's own event loop ran (p99). 'late' failures are answers "
+        "that arrived after the client's time limit.",
     ]
+    for m in runs:
+        if client_overloaded(m):
+            out.append(f"{m.name}: the load generator itself was overloaded (its event loop ran {m.client_lag_p99:.1f} ms "
+                       f"late at p99), so latencies include the client's own delay. Use fewer workers, "
+                       f"or run the client on another machine.")
     failing = [m for m in runs if m.errors]
     for m in failing:
         out.append(f"{m.name}: {m.requests - m.ok} of {m.requests} requests failed "

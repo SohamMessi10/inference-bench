@@ -55,7 +55,8 @@ def predict(base, images):
         with urllib.request.urlopen(request, timeout=10) as response:
             return response.status, json.load(response)
     except urllib.error.HTTPError as exc:
-        return exc.code, None
+        with exc:  # an HTTPError holds the open response; Python 3.14 warns if it isn't closed
+            return exc.code, None
 
 
 @pytest.fixture

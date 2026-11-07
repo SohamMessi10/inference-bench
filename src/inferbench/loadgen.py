@@ -40,9 +40,11 @@ import numpy as np
 
 from inferbench import __version__
 from inferbench.models import load_digits_split
+from inferbench.percentiles import percentile
 from inferbench.server import MAX_IMAGES
 
 LOCAL_HOSTS = {"127.0.0.1", "localhost"}
+LAG_PROBE_S = 0.001
 MAX_CONCURRENCY = 256
 MAX_DURATION = 3600
 
@@ -60,6 +62,7 @@ class LoadConfig:
     images: int = 1              # images per request
     timeout: float = 10.0        # seconds before a request counts as timed out
     seed: int = 0                # which images are sent, in which order
+    backoff_ms: float = 0.0      # after a 503 (server busy or late), wait this long before sending again
 
     def check(self) -> None:
         parts = urlsplit(self.url)
@@ -72,7 +75,8 @@ class LoadConfig:
                 raise LoadError(f"{name} must be a whole number from {low} to {high}, got {value!r}")
         for name, value, low, high in [("duration", self.duration, 0.1, MAX_DURATION),
                                        ("warmup", self.warmup, 0, MAX_DURATION),
-                                       ("timeout", self.timeout, 0.01, 600)]:
+                                       ("timeout", self.timeout, 0.01, 600),
+                                       ("backoff_ms", self.backoff_ms / 1000, 0, 60)]:
             if not low <= value <= high:
                 raise LoadError(f"{name} must be between {low} and {high} seconds, got {value}")
 
@@ -106,6 +110,9 @@ class Run:
     started_at: str
     records: list[Record] = field(default_factory=list)
     measured_seconds: float = 0.0
+    # How late the client's own event loop ran during the measured phase (ms). When the load
+    # generator is overloaded it measures its own delay too, so this says how much to trust it.
+    loop_lag: dict = field(default_factory=dict)
 
     def measured(self) -> list[Record]:
         return [r for r in self.records if r.phase == "measure"]
@@ -166,7 +173,8 @@ def expected_answers(server: dict, images: np.ndarray, labels: np.ndarray) -> li
     return [int(v) for v in labels]
 
 
-async def _send(client, inputs: Inputs, server: dict, phase: str, worker: int, clock0: float) -> Record:
+async def _send(client, inputs: Inputs, server: dict, phase: str, worker: int, clock0: float,
+                timeout_s: float) -> Record:
     images, labels = inputs.take()
     body = json.dumps({"inputs": images.tolist()})
     sent = time.perf_counter()
@@ -177,8 +185,21 @@ async def _send(client, inputs: Inputs, server: dict, phase: str, worker: int, c
                       classify_error(exc), len(images))
     latency_ms = (time.perf_counter() - sent) * 1000
     record = Record(phase, worker, sent - clock0, latency_ms, response.status_code, images=len(images))
+    if response.status_code == 200 and latency_ms > timeout_s * 1000:
+        # The answer came, but after the client's limit; a client that gives up at that point
+        # can't use it. This happens when the client's own event loop is running late: the
+        # answer sits ready in the socket and is read after the deadline without the timeout
+        # firing. Counted as late, not as a success, and the run's loop lag shows why.
+        record.error = "late"
+        return record
     if response.status_code != 200:
         record.error = f"http {response.status_code}"
+        try:  # the server's own short reason, such as "busy" or "deadline", when it gives one
+            reason = response.json().get("reason")
+        except (ValueError, AttributeError):
+            reason = None
+        if isinstance(reason, str) and reason.isalpha() and len(reason) <= 20:
+            record.error += f" {reason}"
         return record
     try:
         data = response.json()
@@ -206,7 +227,7 @@ async def run_load(config: LoadConfig) -> Run:
                             f"start one with: ibench serve") from None
         run = Run(config, info, machine_info(), datetime.now(timezone.utc).isoformat(timespec="seconds"))
         clock0 = time.perf_counter()
-        run.records.append(await _send(client, inputs, info, "first", 0, clock0))
+        run.records.append(await _send(client, inputs, info, "first", 0, clock0, config.timeout))
 
         warmup_end = time.perf_counter() + config.warmup
         measure_end = warmup_end + config.duration
@@ -214,9 +235,26 @@ async def run_load(config: LoadConfig) -> Run:
         async def worker(n: int) -> None:
             while (now := time.perf_counter()) < measure_end:
                 phase = "warmup" if now < warmup_end else "measure"
-                run.records.append(await _send(client, inputs, info, phase, n, clock0))
+                record = await _send(client, inputs, info, phase, n, clock0, config.timeout)
+                run.records.append(record)
+                if record.status == 503 and config.backoff_ms:
+                    # A real client backs off when told the server is busy. Without this, a
+                    # refused worker resends at once and the client spins at full speed.
+                    await asyncio.sleep(config.backoff_ms / 1000)
 
-        await asyncio.gather(*(worker(n) for n in range(config.concurrency)))
+        lags: list[float] = []
+
+        async def lag_probe() -> None:
+            # Ask to wake in 1 ms, see how late the wakeup is: a busy event loop wakes late.
+            while (now := time.perf_counter()) < measure_end:
+                await asyncio.sleep(LAG_PROBE_S)
+                if now >= warmup_end:
+                    lags.append(max((time.perf_counter() - now - LAG_PROBE_S) * 1000, 0.0))
+
+        await asyncio.gather(lag_probe(), *(worker(n) for n in range(config.concurrency)))
+        if lags:
+            run.loop_lag = {"p50_ms": round(percentile(lags, 50), 3), "p99_ms": round(percentile(lags, 99), 3),
+                            "max_ms": round(max(lags), 3), "samples": len(lags)}
         # Measured time runs from the first measured request being sent to the last measured
         # answer, both taken from the records, so the summary always agrees with them. It runs
         # past the deadline: requests sent before it count, so the time they take must too.
@@ -246,6 +284,7 @@ def summary(run: Run) -> dict:
         "mean_latency_ms": round(sum(r.latency_ms for r in ok) / len(ok), 3) if ok else None,
         "accuracy": round(sum(r.correct for r in answered) / sum(r.images for r in answered), 4) if answered else None,
         "warmup_requests": sum(r.phase == "warmup" for r in run.records),
+        "loop_lag": run.loop_lag,
     }
 
 
@@ -273,4 +312,5 @@ def read_results(path: Path) -> Run:
     run.records = [Record(**{k: v for k, v in line.items() if k != "type"}) for line in lines if line["type"] == "request"]
     final = [line for line in lines if line["type"] == "summary"]
     run.measured_seconds = final[-1]["measured_seconds"] if final else 0.0
+    run.loop_lag = final[-1].get("loop_lag", {}) if final else {}
     return run

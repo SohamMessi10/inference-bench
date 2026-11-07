@@ -64,3 +64,10 @@ def test_report_command_refuses_missing_and_foreign_files(capsys, tmp_path):
     other.write_text('{"a": 1}\n')
     assert main(["report", str(other)]) == EXIT_MODEL
     assert "can't be read as results" in capsys.readouterr().err
+
+
+def test_cold_start_reports_a_server_whose_requests_fail(models_dir):
+    # The model fails every call, so the first request gets a 500. (This error path once left
+    # the HTTP response open, which Python 3.14 reports as a leak.)
+    with pytest.raises(ColdStartError, match="a request to the new server failed: HTTP Error 500"):
+        one_trial("digits-small", models_dir, steady_requests=1, server_args=("--fail-rate", "1"))

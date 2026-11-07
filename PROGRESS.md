@@ -2,7 +2,7 @@
 
 ## Status
 
-Milestone 4 of 6 complete: the batching experiment. Overload and failure handling come next.
+Milestone 5 of 6 complete: overload and failure. The final write-up comes next.
 The full plan is in [`docs/design.md`](docs/design.md).
 
 ## Milestones
@@ -137,6 +137,46 @@ The full plan is in [`docs/design.md`](docs/design.md).
   missing from `queue_ms`, a wrong conclusion threshold, latencies swapped in the comparison) and
   are now caught.
 
+### Milestone 5: overload and failure
+- Server protections, both off by default: `--max-waiting N` refuses a request at once with
+  `503 busy` (and `Retry-After`) when N are already waiting; `--deadline-ms` refuses with
+  `503 deadline` a request that waited that long before the model was free, unbatched or
+  batched. Admission happens on the event loop, before a request can queue for a thread.
+- `--fail-rate` wraps the model so a seeded fraction of calls fail; the client gets `500 model`
+  with no internal details, and the full error is logged on the server.
+- `GET /v1/stats`: answered, refused as busy or late, model errors, peak in progress.
+- The load generator records the server's reason (`http 503 busy`), can back off after a 503
+  (`backoff_ms`), measures its own event-loop lag in every run, and counts an answer that arrives
+  after the client's limit as `late`, not as a success. The report shows client lag and warns
+  when the load generator was overloaded (lag over 5 ms and over 10% of the median).
+- `ibench experiment overload`: four servers (no limits, bounded queue, deadline, both) under the
+  same overload, comparing what clients received with what the server computed. Three runs
+  (`docs/overload.md`): no limits answered 0 requests in time and 99% of its work reached nobody;
+  a bounded queue answered 91–92 per second in time, near the model's capacity of about 100, with
+  no wasted work; a deadline alone 79–82.
+- **A result I had to withdraw.** The first overload experiment (64 clients, 50 ms limit,
+  digits-large) reported 4–17× more useful throughput with protection. Successful requests had a
+  95 ms median under a 50 ms limit, which led to the diagnosis: on 2 shared CPUs the client's
+  event loop ran up to 34 ms late, answers were read after the deadline without the timeout
+  firing, and they were counted as successes. With late answers counted honestly that setup
+  mostly measured the client, so it was replaced by one that overloads the server but not the
+  client (lag 3–4 ms).
+- The same lag measurement showed the client was overloaded in the batching experiment at 64
+  workers (p99 14–70 ms). Three more batching runs gave smaller gains (+11–19% at 16, +36–56% at
+  64) than the first three; `docs/batching.md` now reports all six and says which rows to trust.
+- Percentiles moved into one module (`percentiles.py`) after a copy in the load generator would
+  have reintroduced the floating-point bug fixed in milestone 3.
+- Tests (22 new): refusing when full and recovering afterwards, deadlines with batches of 1 and 2,
+  clean 500s, repeatable injected failures, refusal reasons, lag measured and saved, late answers
+  under a deliberately blocked event loop, the warning rule, the overload experiment end to end
+  (wasted work equals what the server computed minus what clients received, from the files).
+- Mutation-checked: 13 deliberate bugs. One survived at first (the batched deadline skipped for a
+  batch's first request, which a batch-of-2 test couldn't see); a batch-of-1 case now catches it.
+- Python 3.14 only: 5 tests failed because an `HTTPError` (which holds the open response) was
+  read but never closed; 3.14 newly warns about that, and the leak-as-failure rule from milestone
+  3 turned the warning into a failure, as intended. Fixed in two test helpers and in one error
+  path of `coldstart.py`, which a new test (a server whose model always fails) now covers.
+
 ## Commands verified
 
 | Where | Python | Command | Result |
@@ -149,12 +189,13 @@ The full plan is in [`docs/design.md`](docs/design.md).
 | Claude's Linux workspace | 3.13 | `ibench report` on three runs; `ibench coldstart` on both models | numbers above |
 | Claude's Linux workspace | 3.12, 3.13, 3.14 | `python -m pytest`, dev and ci profiles | 121 passed (milestone 4) |
 | Claude's Linux workspace | 3.13 | `ibench experiment batching`, digits-large ×3 and synthetic ×1 | docs/batching.md |
+| Claude's Linux workspace | 3.12, 3.13, 3.14 | `python -m pytest`, dev and ci profiles | 143 passed (milestone 5) |
+| Claude's Linux workspace | 3.13 | `ibench experiment overload` ×3, `ibench experiment batching` ×3 more | docs/overload.md, docs/batching.md |
 
 ## Next
 
-Milestone 5: overload and failure. A bounded queue so an overloaded server answers 503 at once
-instead of making requests wait without limit, a request deadline, injected model errors, and
-measurements of how the server and the client behave when things go wrong.
+Milestone 6: the methodology write-up, the full README, a final audit as a reviewer would do
+it, resume bullets, a LinkedIn description, and interview preparation.
 
 ## Concepts to review
 - Why a benchmark must say whether its "model" is real.
@@ -173,3 +214,7 @@ measurements of how the server and the client behave when things go wrong.
 - Why fixed cost per call decides how much batching helps (and why GPUs batch).
 - Comparing like with like: same parallelism in both modes.
 - Why one run isn't enough: the same experiment varied by 31 percentage points.
+- Congestion collapse, load shedding, bounded queues and deadlines.
+- Wasted work: comparing what the server computed with what clients received.
+- When the load generator is the bottleneck, and how to detect it (event-loop lag).
+- Withdrawing a result: why the first overload experiment was wrong.

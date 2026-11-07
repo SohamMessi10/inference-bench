@@ -49,6 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--batch-max-images", type=int, default=64, help="largest batch, in images (default 64)")
     serve.add_argument("--batch-wait-ms", type=float, default=2.0,
                        help="longest a request waits for others to join its batch (default 2)")
+    serve.add_argument("--max-waiting", type=int, default=None,
+                       help="refuse requests with 503 busy when this many are already waiting (default: no limit)")
+    serve.add_argument("--deadline-ms", type=float, default=None,
+                       help="refuse with 503 deadline a request that waited this long before the model (default: none)")
+    serve.add_argument("--fail-rate", type=float, default=0.0,
+                       help="make this fraction of model calls fail on purpose, 0 to 1 (default 0)")
+    serve.add_argument("--fail-seed", type=int, default=0, help="which calls fail, with --fail-rate (default 0)")
     serve.add_argument("--fixed-ms", type=float, default=5.0, help="synthetic model: cost per call")
     serve.add_argument("--per-item-ms", type=float, default=0.5, help="synthetic model: cost per input")
 
@@ -78,34 +85,84 @@ def build_parser() -> argparse.ArgumentParser:
     cold.add_argument("-o", "--output", type=Path, help="also save the results as JSON")
 
     exp = commands.add_parser("experiment", help="run a whole experiment: servers, load, and report")
-    exp.add_argument("name", choices=["batching"], help="batching: the same load with and without batching")
-    exp.add_argument("--model", default="digits-large", choices=[*DIGITS_MODELS, "synthetic"])
+    exp.add_argument("name", choices=["batching", "overload"],
+                     help="batching: the same load with and without batching; overload: heavy load with impatient "
+                          "clients, against a server with and without a bounded queue and a deadline")
+    # Unset options take the chosen experiment's own defaults (see ExperimentConfig and OverloadConfig).
+    exp.add_argument("--model", default=None, choices=[*DIGITS_MODELS, "synthetic"],
+                     help="batching: digits-large; overload: synthetic, 20 ms a call")
     exp.add_argument("--models-dir", type=Path, default=DEFAULT_MODELS_DIR)
-    exp.add_argument("--concurrency", default="1,4,16,64", help="worker counts, comma separated (default 1,4,16,64)")
-    exp.add_argument("--duration", type=float, default=5.0, help="measured seconds per run (default 5)")
-    exp.add_argument("--warmup", type=float, default=1.0, help="warmup seconds per run (default 1)")
-    exp.add_argument("--images", type=int, default=1, help="images per request (default 1)")
-    exp.add_argument("--threads", type=int, default=4, help="model threads, the same in both modes (default 4)")
-    exp.add_argument("--batch-wait-ms", type=float, default=2.0)
-    exp.add_argument("--batch-max-images", type=int, default=64)
-    exp.add_argument("--fixed-ms", type=float, default=5.0, help="synthetic model: cost per call")
-    exp.add_argument("--per-item-ms", type=float, default=0.5, help="synthetic model: cost per input")
-    exp.add_argument("-o", "--output", type=Path, help="folder for the results (default: results/batching-...)")
+    exp.add_argument("--concurrency", default=None,
+                     help="batching: worker counts, comma separated (1,4,16,64); overload: one count (16)")
+    exp.add_argument("--duration", type=float, default=None, help="measured seconds per run (default 5)")
+    exp.add_argument("--warmup", type=float, default=None, help="warmup seconds per run (default 1)")
+    exp.add_argument("--images", type=int, default=None, help="batching: images per request (default 1)")
+    exp.add_argument("--threads", type=int, default=None, help="model threads (batching 4, overload 2)")
+    exp.add_argument("--batch-wait-ms", type=float, default=None, help="batching: default 2")
+    exp.add_argument("--batch-max-images", type=int, default=None, help="batching: default 64")
+    exp.add_argument("--fixed-ms", type=float, default=None, help="synthetic model: cost per call")
+    exp.add_argument("--per-item-ms", type=float, default=None, help="synthetic model: cost per input")
+    exp.add_argument("--client-timeout", type=float, default=None, help="overload: seconds before a client gives up (0.1)")
+    exp.add_argument("--max-waiting", type=int, default=None, help="overload: the bounded queue's size (4)")
+    exp.add_argument("--deadline-ms", type=float, default=None, help="overload: the server's deadline (60)")
+    exp.add_argument("--backoff-ms", type=float, default=None,
+                     help="overload: how long a refused client waits before sending again (20)")
+    exp.add_argument("-o", "--output", type=Path, help="folder for the results (default: results/<name>-...)")
     return parser
+
+
+def _with_defaults(config_class, args, **fields):
+    """Build a config from the options that were given; the rest keep the class's own defaults."""
+    given = {field: getattr(args, option) for field, option in fields.items() if getattr(args, option) is not None}
+    return config_class(**given)
+
+
+def overload_command(args, parser) -> int:
+    from inferbench.experiment import OverloadConfig, overload_conclusion, run_overload
+    from inferbench.procs import ServerStartError
+
+    if args.concurrency is not None:
+        try:
+            args.concurrency = int(args.concurrency)
+        except ValueError:
+            parser.error(f"--concurrency must be one whole number for the overload experiment, got {args.concurrency!r}")
+    config = _with_defaults(OverloadConfig, args, model="model", concurrency="concurrency", duration="duration",
+                            warmup="warmup", threads="threads", client_timeout="client_timeout",
+                            max_waiting="max_waiting", deadline_ms="deadline_ms", backoff_ms="backoff_ms",
+                            fixed_ms="fixed_ms", per_item_ms="per_item_ms")
+    print(f"4 servers, {config.concurrency} workers each, {config.warmup:g} + {config.duration:g} s per server",
+          flush=True)
+    try:
+        out_dir, rows = run_overload(config, args.models_dir, args.output,
+                                     progress=lambda line: print(f"  {line}", flush=True))
+    except (ValueError, ServerStartError) as exc:
+        print(f"ibench: {exc}", file=sys.stderr)
+        return EXIT_MODEL
+    print()
+    for line in overload_conclusion(rows):
+        print(f"- {line}")
+    print(f"report: {out_dir / 'report.md'}")
+    return EXIT_OK
 
 
 def experiment_command(args, parser) -> int:
     from inferbench.experiment import ExperimentConfig, comparison_rows, conclusion, run_experiment
     from inferbench.procs import ServerStartError
 
-    try:
-        levels = tuple(int(part) for part in args.concurrency.split(","))
-    except ValueError:
-        parser.error(f"--concurrency must be whole numbers separated by commas, got {args.concurrency!r}")
-    config = ExperimentConfig(args.model, levels, args.duration, args.warmup, args.images, args.threads,
-                              args.batch_wait_ms, args.batch_max_images, args.fixed_ms, args.per_item_ms)
-    runs = 2 * len(levels)
-    print(f"{runs} runs of {args.warmup:g} + {args.duration:g} s, about {runs * (args.warmup + args.duration) + 5:.0f} s "
+    if args.name == "overload":
+        return overload_command(args, parser)
+
+    if args.concurrency is not None:
+        try:
+            args.concurrency = tuple(int(part) for part in args.concurrency.split(","))
+        except ValueError:
+            parser.error(f"--concurrency must be whole numbers separated by commas, got {args.concurrency!r}")
+    config = _with_defaults(ExperimentConfig, args, model="model", concurrency="concurrency", duration="duration",
+                            warmup="warmup", images="images", threads="threads", batch_wait_ms="batch_wait_ms",
+                            batch_max_images="batch_max_images", fixed_ms="fixed_ms", per_item_ms="per_item_ms")
+    runs = 2 * len(config.concurrency)
+    print(f"{runs} runs of {config.warmup:g} + {config.duration:g} s, "
+          f"about {runs * (config.warmup + config.duration) + 5:.0f} s "
           f"in all", flush=True)
     try:
         out_dir, results = run_experiment(config, args.models_dir, args.output,
@@ -222,6 +279,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         model = load_model(args.model, args.models_dir, **(
             {"fixed_ms": args.fixed_ms, "per_item_ms": args.per_item_ms} if args.model == "synthetic" else {}))
+        if args.fail_rate:
+            from inferbench.models import FlakyModel
+            model = FlakyModel(model, args.fail_rate, args.fail_seed)
     except ModelError as exc:
         print(f"ibench: {exc}", file=sys.stderr)
         return EXIT_MODEL
@@ -240,11 +300,19 @@ def main(argv: list[str] | None = None) -> int:
             batching.check()
         except ValueError as exc:
             parser.error(str(exc))
+    try:
+        app = create_app(model, threads=args.threads, batching=batching, max_waiting=args.max_waiting,
+                         deadline_ms=args.deadline_ms)
+    except ValueError as exc:
+        parser.error(str(exc))
     mode = f"batching up to {batching.max_images} images or {batching.max_wait_ms:g} ms" if batching else "no batching"
+    limits = [f"at most {args.max_waiting} waiting" if args.max_waiting is not None else "",
+              f"a {args.deadline_ms:g} ms deadline" if args.deadline_ms is not None else "",
+              f"{args.fail_rate:.0%} of calls failing on purpose" if args.fail_rate else ""]
+    extra = "".join(f", {x}" for x in limits if x)
     print(f"serving {model.info.name} ({model.info.kind}) on http://{args.host}:{args.port} with "
-          f"{args.threads} model threads, {mode}; Ctrl+C to stop", flush=True)
-    uvicorn.run(create_app(model, threads=args.threads, batching=batching), host=args.host, port=args.port,
-                log_level="warning", access_log=False)
+          f"{args.threads} model threads, {mode}{extra}; Ctrl+C to stop", flush=True)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning", access_log=False)
     return EXIT_OK
 
 

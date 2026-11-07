@@ -90,3 +90,63 @@ def test_comparison_rows_put_each_number_in_its_column():
     assert (r["throughput_off"], r["throughput_on"], r["throughput_change"]) == (100.0, 150.0, "+50%")
     assert (r["p50_off"], r["p50_on"], r["p50_change"]) == (30.0, 5.0, "-83%")
     assert (r["p99_off"], r["p99_on"]) == (30.0, 5.0) and r["failed"] == 1
+
+
+def test_overload_modes_differ_only_in_their_protections():
+    from inferbench.experiment import OverloadConfig
+
+    config = OverloadConfig(model="synthetic", max_waiting=3, deadline_ms=20, threads=2)
+    modes = dict(config.modes())
+    assert list(modes) == ["no limits", "at most 3 waiting", "20 ms deadline", "both"]
+    assert modes["no limits"] == [] and modes["both"] == modes["at most 3 waiting"] + modes["20 ms deadline"]
+    assert config.server_args(modes["both"])[:4] == ["--model", "synthetic", "--threads", "2"]
+
+
+def test_overload_conclusion_counts_wasted_work():
+    from inferbench.experiment import overload_conclusion
+
+    rows = [{"mode": "no limits", "ok_per_second": 30.0, "ok": 150, "requests": 3000, "server_answered": 3000,
+             "wasted": 2700},
+            {"mode": "both", "ok_per_second": 500.0, "ok": 2500, "requests": 5000, "server_answered": 2600,
+             "wasted": 0}]
+    assert overload_conclusion(rows) == [
+        "Most useful answers per second: both (500.0/s).",
+        "no limits: 150 of 3000 measured requests answered in time; the server computed 3000 answers and 2700 "
+        "(90%) reached nobody, because the client had already given up.",
+        "both: 2500 of 5000 measured requests answered in time; the server computed 2600 answers and 0 (0%) "
+        "reached nobody, because the client had already given up.",
+    ]
+
+
+def test_a_small_real_overload_experiment(tmp_path, models_dir):
+    # A synthetic model (40 ms a call, 1 thread) and 8 impatient clients (60 ms): without limits
+    # the queue outgrows the timeout and most answers arrive too late; with them, they don't.
+    from inferbench.experiment import OverloadConfig, run_overload
+
+    config = OverloadConfig(model="synthetic", concurrency=8, duration=1.0, warmup=0.2, threads=1,
+                            client_timeout=0.06, max_waiting=0, deadline_ms=10, fixed_ms=40, per_item_ms=0)
+    out_dir, rows = run_overload(config, models_dir, tmp_path / "ovl", progress=lambda line: None)
+    assert sorted(p.name for p in out_dir.iterdir()) == [f"mode{i}.jsonl" for i in range(4)] + ["report.md"]
+    by_mode = {r["mode"]: r for r in rows}
+    unprotected, protected = by_mode["no limits"], by_mode["both"]
+    assert unprotected["wasted"] > protected["wasted"]
+    assert protected["refused_busy"] > 0 and unprotected["refused_busy"] == 0
+    assert "timeout" in unprotected["errors"]
+    for index, r in enumerate(rows):
+        # Answers received count every phase (the server's counter covers them all), and what
+        # reached nobody is exactly the difference.
+        records = [json.loads(line) for line in (out_dir / f"mode{index}.jsonl").read_text().splitlines()[1:-1]]
+        assert r["client_received"] == sum(rec["status"] == 200 and not rec["error"] for rec in records)
+        assert r["client_received"] <= r["server_answered"]
+        assert r["wasted"] == r["server_answered"] - r["client_received"]
+    assert (out_dir / "report.md").read_text().startswith("# Overload experiment: synthetic")
+
+
+def test_overload_command(capsys, tmp_path, models_dir):
+    code = main(["experiment", "overload", "--model", "synthetic", "--models-dir", str(models_dir),
+                 "--concurrency", "4", "--duration", "0.3", "--warmup", "0", "--threads", "1",
+                 "--client-timeout", "0.5", "-o", str(tmp_path / "o")])
+    assert code == EXIT_OK
+    assert "Most useful answers per second" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        main(["experiment", "overload", "--concurrency", "4,8"])

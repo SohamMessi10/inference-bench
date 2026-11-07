@@ -56,6 +56,8 @@ def one_trial(model: str, models_dir: Path, steady_requests: int = 20, timeout: 
     except ServerStartError as exc:
         raise ColdStartError(str(exc)) from None
     except (urllib.error.URLError, OSError) as exc:
+        if isinstance(exc, urllib.error.HTTPError):
+            exc.close()  # it holds the open response; Python 3.14 warns if it isn't closed
         raise ColdStartError(f"a request to the new server failed: {exc}") from None
     return Trial(server.startup_s, first_ms, statistics.median(steady))
 

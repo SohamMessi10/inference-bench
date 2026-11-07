@@ -40,5 +40,13 @@ ibench experiment batching --model digits-large
 ```
 
 runs the whole batching experiment: the same load with and without dynamic batching, at 1, 4, 16
-and 64 workers, with a report. Results from three runs are in [`docs/batching.md`](docs/batching.md):
-batching cost about 40% of throughput with one worker and added 74–105% with 64.
+and 64 workers, with a report. Over six runs ([`docs/batching.md`](docs/batching.md)), batching
+cost 39–47% of throughput with one worker and helped by 11% to 105% at 16 and 64.
+
+```bash
+ibench experiment overload
+```
+
+overloads a server whose clients give up after 100 ms. Without limits it collapsed: busy the
+whole time, it answered nothing in time and 99% of its work reached nobody. With a bounded queue
+it answered 91–92 requests a second in time, near its capacity ([`docs/overload.md`](docs/overload.md)).
