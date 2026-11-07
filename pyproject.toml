@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inference-bench"
+version = "0.1.0"
+description = "Measure how concurrency and batching affect the latency and throughput of a small model server."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+# Lower bounds are releases at least two weeks old when they were chosen (2026-11-07).
+dependencies = [
+    "numpy>=2.5,<3",
+    "scikit-learn>=1.9,<2",
+    "fastapi>=0.162,<1",
+    "uvicorn>=0.54,<1",
+    "pydantic>=2.14,<3",
+    "httpx2>=2.16,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1,<10",
+    "hypothesis>=6.170,<7",
+]
+
+[project.scripts]
+ibench = "inferbench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
