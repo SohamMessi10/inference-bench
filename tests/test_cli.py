@@ -44,3 +44,28 @@ def test_bad_synthetic_cost_exits_1(capsys):
 def test_command_runs_as_a_module():
     run = subprocess.run([sys.executable, "-m", "inferbench.cli", "--version"], capture_output=True, text=True)
     assert run.stdout.strip() == f"ibench {__version__}"
+
+
+def test_every_command_in_the_docs_is_valid():
+    # Each `ibench ...` line in the README and docs must parse, so the docs can't drift away from
+    # the command line. (The design doc once showed `--concurrency 1,4,16` for `load`, which only
+    # takes one number.)
+    import re
+    import shlex
+    from pathlib import Path
+
+    from inferbench.cli import build_parser
+
+    root = Path(__file__).resolve().parent.parent
+    lines = []
+    for doc in [root / "README.md", *sorted((root / "docs").glob("*.md"))]:
+        for block in re.findall(r"```(?:bash)?\n(.*?)```", doc.read_text(encoding="utf-8"), re.S):
+            lines += [(doc.name, line.strip()) for line in block.splitlines() if line.strip().startswith("ibench ")]
+    assert len(lines) >= 10
+    parser = build_parser()
+    for doc, line in lines:
+        words = shlex.split(line.split("  ")[0])[1:]  # drop "ibench" and any aligned comment
+        try:
+            parser.parse_args(words)
+        except SystemExit:
+            pytest.fail(f"{doc}: `{line}` isn't a valid command")

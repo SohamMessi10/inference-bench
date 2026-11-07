@@ -228,7 +228,8 @@ def run_load_command(args) -> int:
                         images=args.images, timeout=args.timeout, seed=args.seed)
     try:
         config.check()
-        print(f"loading {config.url} with {config.concurrency} workers, {config.images} image(s) per request: "
+        workers = "1 worker" if config.concurrency == 1 else f"{config.concurrency} workers"
+        print(f"loading {config.url} with {workers}, {config.images} image(s) per request: "
               f"{config.warmup:g} s warmup, then {config.duration:g} s measured ...", flush=True)
         run = asyncio.run(run_load(config))
     except LoadError as exc:

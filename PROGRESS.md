@@ -2,7 +2,8 @@
 
 ## Status
 
-Milestone 5 of 6 complete: overload and failure. The final write-up comes next.
+**All six milestones complete.** The README, the methodology, and the two experiment write-ups
+are in place; see the README for the findings.
 The full plan is in [`docs/design.md`](docs/design.md).
 
 ## Milestones
@@ -177,6 +178,21 @@ The full plan is in [`docs/design.md`](docs/design.md).
   3 turned the warning into a failure, as intended. Fixed in two test helpers and in one error
   path of `coldstart.py`, which a new test (a server whose model always fails) now covers.
 
+### Milestone 6: write-up and final review
+- `README.md` rewritten for a first-time reader: the findings first (batching, overload, and the
+  withdrawn result), a quick start, a real report from the build machine, how it works, the
+  methodology in brief, testing, security, limitations.
+- `docs/methodology.md`: the seven rules behind every number, and where each is enforced.
+- `docs/design.md` brought up to date with what was built. It still described a `load` option
+  that doesn't exist (`--concurrency 1,4,16`), an HTML report that was never built, and an API
+  without `/v1/stats` or the refusal reasons.
+- A test parses every `ibench` command shown in the README and docs, so they can't drift from
+  the code; it was checked by putting the old wrong command back, which it caught.
+- Followed the README as a new user (fresh clone, fresh environment): train, serve, three load
+  runs, report, cold start. All worked; the only fix was "1 workers" in the load message.
+- Audit: no leftover debugging code; the three broad exception handlers are deliberate (a model
+  failure becomes a clean 500, logged in full on the server).
+
 ## Commands verified
 
 | Where | Python | Command | Result |
@@ -190,12 +206,14 @@ The full plan is in [`docs/design.md`](docs/design.md).
 | Claude's Linux workspace | 3.12, 3.13, 3.14 | `python -m pytest`, dev and ci profiles | 121 passed (milestone 4) |
 | Claude's Linux workspace | 3.13 | `ibench experiment batching`, digits-large ×3 and synthetic ×1 | docs/batching.md |
 | Claude's Linux workspace | 3.12, 3.13, 3.14 | `python -m pytest`, dev and ci profiles | 143 passed (milestone 5) |
+| Claude's Linux workspace | 3.12, 3.13, 3.14 | `python -m pytest`, dev and ci profiles | 144 passed (milestone 6) |
+| Claude's Linux workspace | 3.13 | the README's commands, as a new user, from a fresh clone | all worked |
 | Claude's Linux workspace | 3.13 | `ibench experiment overload` ×3, `ibench experiment batching` ×3 more | docs/overload.md, docs/batching.md |
 
 ## Next
 
-Milestone 6: the methodology write-up, the full README, a final audit as a reviewer would do
-it, resume bullets, a LinkedIn description, and interview preparation.
+Possible extensions: an open-loop load mode, a real ONNX or PyTorch model, an HTML report with
+charts, and running the client on a separate machine.
 
 ## Concepts to review
 - Why a benchmark must say whether its "model" is real.

@@ -35,32 +35,36 @@ failures needed to trust it.
    and request size. Percentiles that the sample size can't support are marked, not printed.
 5. A batching experiment: the same model served with and without dynamic batching, across
    concurrency levels, with the measured tradeoff stated even if batching doesn't help.
+6. Overload protection and an overload experiment: a bounded queue and a deadline, injected
+   model failures, and a comparison of what the server computed with what clients received.
 
-**Optional, later:** an open-loop (fixed arrival rate) mode; cancellation and backpressure;
-comparing model versions; streaming responses; running in containers.
+**Not built (possible extensions):** an open-loop (fixed arrival rate) mode; an HTML report with
+charts; comparing model versions; streaming responses; running in containers.
 
 ## User flow
 
 ```
 ibench train                          train both digits models, report test accuracy
 ibench serve --model digits-large     start the server on 127.0.0.1:8000
-ibench load --concurrency 1,4,16 ...  send load, write one results file per run
-ibench report results/*.jsonl         a table and an HTML report comparing the runs
+ibench load --concurrency 16          send load for 10 s, write every request to results/
+ibench report results/*.jsonl         one table comparing the runs, with notes
+ibench coldstart                      time fresh servers' startup and first request
 ```
 
-`ibench experiment batching` runs the whole batching experiment (start servers, warm up, load,
-report) as one reproducible command.
+`ibench experiment batching` and `ibench experiment overload` run whole experiments (start
+servers, warm up, load, report) as one reproducible command each.
 
 ## Architecture
 
 ```
  load generator (httpx2, asyncio)  ──HTTP──►  model server (FastAPI + uvicorn)
-   N concurrent workers                          /v1/predict
-   one record per request                         │  validate → (batcher) → model in a worker thread
-   results/<run>.jsonl                            ▼
-          │                                     Model: digits-small | digits-large | synthetic
+   N concurrent workers                          admission (bounded queue) → /v1/predict
+   one record per request                         │  validate → (batcher) → deadline → model thread
+   its own event-loop lag                         ▼
+   results/<run>.jsonl                          Model: digits-small | digits-large | synthetic
+          │                                       (optionally failing on purpose)
           ▼
- report: percentiles, throughput, errors, hardware → table + HTML
+ report: percentiles, throughput, errors, client lag, hardware → text or Markdown table
 ```
 
 There is no database: each run is a JSON Lines file of per-request records plus a header with
@@ -95,47 +99,39 @@ the run's configuration and hardware, which is easy to keep, diff, and reprocess
 | Request | Response |
 |---|---|
 | `POST /v1/predict` `{"inputs": [[64 numbers 0–16], ...]}` (1–64 images) | `{"model", "predictions": [digit, ...], "timing": {"queue_ms", "inference_ms", "batch_size"}}` |
-| `GET /v1/model` | name, kind (`real` or `synthetic`), input shape, test accuracy, parameters |
+| `GET /v1/model` | name, kind (`real` or `synthetic`), input shape, test accuracy, parameters, the server's settings |
+| `GET /v1/stats` | answered, refused as busy, refused as late, model errors, peak in progress |
 | `GET /health` | `{"status": "ok"}` |
 
-Errors: 422 invalid input (wrong length, out of range, not finite, too many images); 413 body
-too large; 503 when the server's queue is full (later milestones). The server reports its own
-timings so the client can split latency into network, queueing, and inference.
+Errors: 422 invalid input (wrong length, out of range, not finite, too many images), saying where
+each problem is without echoing the values; 413 body too large; 503 `busy` (queue full, with
+`Retry-After`) or `deadline` (waited too long to be worth running); 500 `model` (the model failed;
+no internal details). The server reports its own timings so the client can split latency into
+network, queueing, and inference.
 
 ## Security
 
 Runs on one machine: listens on 127.0.0.1 only, rejects other Host headers (DNS rebinding),
 grants no CORS, caps request size, and validates every input strictly. No secrets or accounts.
 
-## Measurement methodology (the important part)
+## Measurement methodology
 
-- **Closed loop first:** N workers each send a request, wait for the answer, and send the next.
-  It's simple but understates latency under overload, because a slow server slows the senders
-  down too ("coordinated omission"). That is stated in every report, and an open-loop mode with
-  a fixed arrival rate is an optional extension.
-- **Warmup is excluded** from results and recorded; **cold start** (the first request after the
-  server starts) is measured separately.
-- **Every request is kept,** including failures and timeouts. Throughput counts successes, and
-  the error rate is always shown next to it.
-- **Percentiles need samples:** a percentile is shown only when at least 10 measurements lie
-  beyond it: 20 successful requests for p50, 200 for p95, 1,000 for p99. Otherwise the report
-  shows `n<200` (and so on) instead of a number. Percentiles are nearest-rank, so each one is a
-  latency some request really had.
-- **Hardware and software** are recorded with every run. Client and server share the machine,
-  which is a limitation the report states.
+The rules every number follows (closed loop, warmup, failures kept, the percentile sample rule,
+client lag, late answers, ranges over runs) are in [`methodology.md`](methodology.md).
 
 ## Testing strategy
 
-Unit tests for the model (accuracy threshold, numpy versus scikit-learn), input validation, and
-percentile maths (checked against a brute-force definition with Hypothesis); API tests through
-the test client; and, from the job runner's lesson, tests against a real server under
-concurrent load, because a test client can hide threading bugs.
+Unit tests for the model (accuracy, numpy versus scikit-learn, batch invariance), input
+validation, and percentile maths (checked against a brute-force definition with Hypothesis); API
+tests through the test client; and, from the job runner's lesson, tests against real server
+processes under concurrent load, because a test client can hide threading bugs. Leaks (unclosed
+files, pipes, responses) fail the tests. Every milestone was mutation-checked by hand.
 
 ## Deployment
 
 A local tool, installed with pip; CI runs the tests on Linux and macOS. Results and trained
-weights stay out of Git (`models/`, `results/`), apart from small example results kept for the
-README.
+weights are generated, machine-specific, and stay out of Git (`models/`, `results/`); the
+measured results that matter are written up in `docs/`.
 
 ## Milestones
 
@@ -147,4 +143,4 @@ README.
    results in [`batching.md`](batching.md))*
 5. Overload and failure: a bounded queue (503), client timeouts, injected server errors. *(complete:
    results in [`overload.md`](overload.md))*
-6. Methodology write-up, README, resume material.
+6. Methodology write-up, README, resume material. *(complete)*
