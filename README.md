@@ -11,7 +11,16 @@ ibench train
 ibench serve --model digits-large
 ```
 
+Then, in a second terminal:
+
+```bash
+ibench load --concurrency 4 --duration 10
+```
+
 `ibench train` trains two small neural networks that read handwritten digits, using the dataset
 that ships with scikit-learn, and reports their accuracy on images they never saw. `ibench serve`
 serves one of them on http://127.0.0.1:8000 (interactive docs at `/docs`). A `synthetic` model,
 which only waits for a set time and says so, is there for controlled experiments.
+
+`ibench load` sends real held-out digit images from several concurrent workers, checks every
+answer, and writes every request (failures included) to a file in `results/`.

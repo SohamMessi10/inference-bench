@@ -2,7 +2,7 @@
 
 ## Status
 
-Milestone 1 of 6 complete: the models and the server. The load generator comes next.
+Milestone 2 of 6 complete: the load generator. Metrics and the report come next.
 The full plan is in [`docs/design.md`](docs/design.md).
 
 ## Milestones
@@ -41,18 +41,51 @@ The full plan is in [`docs/design.md`](docs/design.md).
   queueing test). One was equivalent: allowing NaN, because NaN and ±Infinity fail the 0–16
   range check anyway; the explicit check stays for clarity.
 
+### Milestone 2: the load generator
+- `loadgen.py`: closed-loop load with `httpx2`'s async client: N workers, each sending a request
+  and waiting for its answer. Phases: one `first` request on its own, `warmup` (recorded, not
+  counted), then `measure`. Inputs are the 450 held-out digit images in a seeded order, and every
+  answer is checked: against the true digit for a real model, against the documented rule for
+  the synthetic one.
+- One record per request, failures included: send time, latency, HTTP status, an error name
+  (`timeout`, `connect`, `protocol`, `http 503`, `wrong number of answers`, `unreadable answer`),
+  images, how many answers were right, and the server's own queue and inference times.
+- Results files (JSON Lines): a header with the configuration, the method ("closed loop"), what
+  `/v1/model` reported, and the machine (OS, CPU, cores, Python and library versions); one line
+  per request; a summary. Written atomically; `read_results` reads them back exactly.
+- `ibench load` (local URLs only: this measures your own machine, it isn't a tool for sending
+  load elsewhere). Exit code 1 if every request failed.
+- First real measurement, digits-large with 4 model threads, 4 s per run on the 2-CPU
+  workspace: 1 worker 363 requests/s at 2.7 ms mean; 4 workers 598/s at 6.6 ms; 16 workers 609/s
+  at 26.1 ms. Throughput stops growing at the thread count while latency keeps rising: the extra
+  requests just queue. Answers stayed 97.7–97.8% correct, matching held-out accuracy.
+- Tests (25 new) against real uvicorn servers: a healthy run, closed-loop behaviour (no worker
+  sends before its answer arrives; never more requests in flight than workers), timeouts
+  recorded, a deliberately broken server (503s, wrong answers, short answers, garbage), a server
+  that dies mid-run, no server at all, config validation, repeatable inputs, the file round trip.
+- Bugs found: (1) the summary saved measured time rounded to milliseconds, so throughput
+  recomputed from a results file came out 0.1/s different; the exact value is now stored.
+  (2) The measured window began from a timestamp about 67 µs before the first record's own send
+  time; it is now computed from the records, so the two always agree.
+- Mutation-checked: 11 deliberate bugs. Two survived at first (measured time stopping at the
+  deadline, and throughput counting warmup requests); a test with slow requests and a warmup that
+  recomputes both from the raw records now catches them. A wrong assumption in that new test (where the
+  deadline falls) was corrected.
+
 ## Commands verified
 
 | Where | Python | Command | Result |
 |---|---|---|---|
 | Claude's Linux workspace | 3.12, 3.13, 3.14 | `python -m pytest`, dev and ci profiles | 54 passed (milestone 1) |
 | Claude's Linux workspace | 3.13 | `ibench train`, `ibench serve --model digits-large`, one real request | 3 of 3 digits right |
+| Claude's Linux workspace | 3.12, 3.13, 3.14 | `python -m pytest`, dev and ci profiles | 79 passed (milestone 2) |
+| Claude's Linux workspace | 3.13 | `ibench load` at 1, 4 and 16 workers against digits-large | all requests ok |
 
 ## Next
 
-Milestone 2: the load generator. N concurrent workers send requests for a set time after a
-warmup, and every request is recorded (when it was sent, how long it took, status, the server's
-own timings), failures included, in a results file with the run's configuration.
+Milestone 3: metrics and the report. Percentiles (p50/p95/p99) with sample-size rules (p95
+needs 200 successes, p99 1,000), latency split into waiting and model time, cold start after a
+fresh server start, and a report comparing runs with the hardware and settings of each.
 
 ## Concepts to review
 - Why a benchmark must say whether its "model" is real.
@@ -60,3 +93,6 @@ own timings), failures included, in a results file with the run's configuration.
 - Batch invariance: why batching must not change answers, and why float32 sums can differ slightly.
 - Thread pools in FastAPI: plain `def` endpoints, anyio's default of 40, and why to set it.
 - Why a test client isn't enough: testing against a real server process.
+- Closed-loop load and coordinated omission: why it understates latency under overload.
+- Why failures must stay in the results, and why answers are checked under load.
+- Saturation: throughput flattens at the server's capacity while latency keeps growing.

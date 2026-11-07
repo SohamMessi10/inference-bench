@@ -1,12 +1,15 @@
-"""Command line: `ibench train` and `ibench serve`.
+"""Command line: `ibench train`, `ibench serve`, and `ibench load`.
 
-Exit codes: 0 success, 1 a model can't be trained or loaded, 2 wrong command usage.
+Exit codes: 0 success; 1 a model can't be trained or loaded, or a load test couldn't run or
+every request failed; 2 wrong command usage.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from inferbench import __version__
@@ -43,12 +46,55 @@ def build_parser() -> argparse.ArgumentParser:
                        help="how many requests can run the model at once (1 to 64; default 4)")
     serve.add_argument("--fixed-ms", type=float, default=5.0, help="synthetic model: cost per call")
     serve.add_argument("--per-item-ms", type=float, default=0.5, help="synthetic model: cost per input")
+
+    load = commands.add_parser("load", help="send load to a running server and record every request",
+                               description="Closed-loop load: each worker waits for an answer before sending "
+                                           "the next request. Every request is recorded, failures included.")
+    load.add_argument("--url", default="http://127.0.0.1:8000", help="the server (this computer only)")
+    load.add_argument("--concurrency", type=int, default=4, help="workers sending at once (default 4)")
+    load.add_argument("--duration", type=float, default=10.0, help="seconds of measured load (default 10)")
+    load.add_argument("--warmup", type=float, default=2.0, help="seconds of load before measuring (default 2)")
+    load.add_argument("--images", type=int, default=1, help="images per request, 1 to 64 (default 1)")
+    load.add_argument("--timeout", type=float, default=10.0, help="seconds before a request times out (default 10)")
+    load.add_argument("--seed", type=int, default=0, help="which images are sent, in which order (default 0)")
+    load.add_argument("-o", "--output", type=Path,
+                      help="results file (default: results/<model>-c<concurrency>-<time>.jsonl)")
     return parser
+
+
+def run_load_command(args) -> int:
+    from inferbench.loadgen import LoadConfig, LoadError, run_load, summary, write_results
+
+    config = LoadConfig(url=args.url, concurrency=args.concurrency, duration=args.duration, warmup=args.warmup,
+                        images=args.images, timeout=args.timeout, seed=args.seed)
+    try:
+        config.check()
+        print(f"loading {config.url} with {config.concurrency} workers, {config.images} image(s) per request: "
+              f"{config.warmup:g} s warmup, then {config.duration:g} s measured ...", flush=True)
+        run = asyncio.run(run_load(config))
+    except LoadError as exc:
+        print(f"ibench: {exc}", file=sys.stderr)
+        return EXIT_MODEL
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = args.output or Path("results") / f"{run.server.get('name', 'server')}-c{config.concurrency}-{stamp}.jsonl"
+    write_results(run, path)
+    s = summary(run)
+    kind = run.server.get("kind", "?")
+    print(f"{run.server.get('name')} ({kind}): {s['requests']} requests in {s['measured_seconds']:.2f} s, "
+          f"{s['ok']} ok, {s['requests'] - s['ok']} failed {s['errors'] or ''}".rstrip())
+    if s["ok"]:
+        accuracy = f", {s['accuracy']:.2%} of answers correct" if kind == "real" else ""
+        print(f"  {s['ok_per_second']} requests/s ({s['images_per_second']} images/s), "
+              f"mean latency {s['mean_latency_ms']} ms{accuracy}")
+    print(f"  every request is in {path}")
+    return EXIT_OK if s["ok"] else EXIT_MODEL
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "load":
+        return run_load_command(args)
     if args.command == "train":
         if unknown := [n for n in args.names if n not in DIGITS_MODELS]:
             parser.error(f"unknown model {', '.join(unknown)}; choose from {', '.join(DIGITS_MODELS)}")

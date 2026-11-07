@@ -138,8 +138,8 @@ README.
 ## Milestones
 
 1. Models and the server: training, the digits models and the synthetic model, `/v1/predict`,
-   validation, tests including a real server.
-2. Load generator: concurrent workers, per-request records, warmup, results files.
+   validation, tests including a real server. *(complete)*
+2. Load generator: concurrent workers, per-request records, warmup, results files. *(complete)*
 3. Metrics and report: percentiles with sample-size rules, cold start, hardware, comparison.
 4. Batching experiment: a dynamic batcher in the server and the experiment across concurrency.
 5. Overload and failure: a bounded queue (503), client timeouts, injected server errors.
