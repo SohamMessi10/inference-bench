@@ -2,7 +2,7 @@
 
 ## Status
 
-Milestone 2 of 6 complete: the load generator. Metrics and the report come next.
+Milestone 3 of 6 complete: metrics, cold start, and the report. The batching experiment comes next.
 The full plan is in [`docs/design.md`](docs/design.md).
 
 ## Milestones
@@ -72,6 +72,44 @@ The full plan is in [`docs/design.md`](docs/design.md).
   recomputes both from the raw records now catches them. A wrong assumption in that new test (where the
   deadline falls) was corrected.
 
+### Milestone 3: metrics, cold start, and the report
+- `metrics.py`: nearest-rank percentiles (always a latency some request really had), shown only
+  when at least 10 measurements lie beyond them: p50 needs 20 successful requests, p95 200, p99
+  1,000. Each run's latency splits into wait (in the server before the model), model, and other
+  (HTTP, JSON, the event loop), from the server's own timings.
+- `report.py` and `ibench report FILES [--format text|markdown]`: one row per run, then notes on
+  the method, the sample rule, every failure, synthetic models, and the machines, including a
+  warning when runs come from different machines or Python versions.
+- `coldstart.py` and `ibench coldstart`: starts a fresh server per trial and times startup (to the
+  first `/health` answer), the first request, and the median of the next 20.
+- Measured on the 2-CPU workspace, digits-large, 4 model threads:
+
+  | Workers | p50 | p95 | p99 | Wait | Model | Other |
+  |---:|---:|---:|---:|---:|---:|---:|
+  | 1 | 2.61 ms | 3.23 | 4.39 | 0.60 | 0.25 | 1.82 |
+  | 4 | 5.77 | 11.81 | 15.20 | 1.85 | 0.64 | 4.11 |
+  | 16 | 25.53 | 35.45 | 40.68 | 9.89 | 1.28 | 14.91 |
+
+  The model is a small part of each request (0.25 of 2.6 ms with one worker); most of the time is
+  HTTP, JSON and Python overhead, which is what batching could spread over many images.
+- Cold start, 3 trials each: a fresh server answers in 0.35–0.40 s; its first request takes about
+  1.5× a typical one (digits-small 2.7 vs 1.6 ms; digits-large 3.4 vs 2.2 ms).
+- Tests (19 new): percentiles against their definition with Hypothesis, the sample rule at its
+  boundary, metrics from hand-made records, the report's notes, cold start against real servers,
+  both commands and their errors.
+- Bug found: in floating point, 1 − 99.9/100 isn't exactly 0.001, so the rule asked for 10,001
+  samples for p99.9; an earlier `round()` workaround had hidden the same issue at p95. Both the
+  rank and the rule now use exact fractions of the decimal as written.
+- Bug found by running the tests with warnings as errors: the cold-start code captured each
+  server's error output in a pipe it never read or closed. Besides the leak, a server that wrote
+  enough errors could have filled the pipe and frozen mid-measurement. It now writes to a
+  temporary file that is read only on failure and always closed, and the test settings now treat
+  any unclosed file or pipe as a failure, in CI too.
+- Mutation-checked: 11 deliberate bugs (off-by-one ranks, rounding instead of ceiling, no sample
+  rule, a weaker rule, warmup included, wait counted twice, accuracy per request instead of per
+  image, unexplained gaps, unflagged mixed machines, unreported failures, the first request
+  ignored). All 11 were caught.
+
 ## Commands verified
 
 | Where | Python | Command | Result |
@@ -80,12 +118,15 @@ The full plan is in [`docs/design.md`](docs/design.md).
 | Claude's Linux workspace | 3.13 | `ibench train`, `ibench serve --model digits-large`, one real request | 3 of 3 digits right |
 | Claude's Linux workspace | 3.12, 3.13, 3.14 | `python -m pytest`, dev and ci profiles | 79 passed (milestone 2) |
 | Claude's Linux workspace | 3.13 | `ibench load` at 1, 4 and 16 workers against digits-large | all requests ok |
+| Claude's Linux workspace | 3.12, 3.13, 3.14 | `python -m pytest`, dev and ci profiles | 98 passed (milestone 3) |
+| Claude's Linux workspace | 3.13 | `ibench report` on three runs; `ibench coldstart` on both models | numbers above |
 
 ## Next
 
-Milestone 3: metrics and the report. Percentiles (p50/p95/p99) with sample-size rules (p95
-needs 200 successes, p99 1,000), latency split into waiting and model time, cold start after a
-fresh server start, and a report comparing runs with the hardware and settings of each.
+Milestone 4: the batching experiment. A dynamic batcher in the server collects requests that
+arrive close together (up to a size and a wait limit) and runs them through the model as one
+batch. Then one command runs the same load with and without it, across concurrency levels, and
+reports the measured tradeoff, whichever way it goes.
 
 ## Concepts to review
 - Why a benchmark must say whether its "model" is real.
@@ -96,3 +137,7 @@ fresh server start, and a report comparing runs with the hardware and settings o
 - Closed-loop load and coordinated omission: why it understates latency under overload.
 - Why failures must stay in the results, and why answers are checked under load.
 - Saturation: throughput flattens at the server's capacity while latency keeps growing.
+- Nearest-rank percentiles, and why a p99 needs about 1,000 samples.
+- Where request time really goes: waiting, the model, and everything else.
+- Cold start versus steady state.
+- Floating-point traps in simple arithmetic, and exact fractions.

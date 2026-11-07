@@ -1,4 +1,4 @@
-"""Command line: `ibench train`, `ibench serve`, and `ibench load`.
+"""Command line: `ibench train`, `serve`, `load`, `report`, and `coldstart`.
 
 Exit codes: 0 success; 1 a model can't be trained or loaded, or a load test couldn't run or
 every request failed; 2 wrong command usage.
@@ -59,7 +59,63 @@ def build_parser() -> argparse.ArgumentParser:
     load.add_argument("--seed", type=int, default=0, help="which images are sent, in which order (default 0)")
     load.add_argument("-o", "--output", type=Path,
                       help="results file (default: results/<model>-c<concurrency>-<time>.jsonl)")
+
+    report = commands.add_parser("report", help="compare results files in one table")
+    report.add_argument("files", nargs="+", type=Path, help="results files written by ibench load")
+    report.add_argument("--format", choices=["text", "markdown"], default="text")
+
+    cold = commands.add_parser("coldstart", help="time a fresh server's startup and first request",
+                               description="Start a fresh server for each trial; time its startup, its first "
+                                           "request, and the typical request after that.")
+    cold.add_argument("--model", default="digits-small", choices=[*DIGITS_MODELS, "synthetic"])
+    cold.add_argument("--models-dir", type=Path, default=DEFAULT_MODELS_DIR)
+    cold.add_argument("--trials", type=int, default=5, help="fresh servers to start (default 5)")
+    cold.add_argument("-o", "--output", type=Path, help="also save the results as JSON")
     return parser
+
+
+def report_command(args) -> int:
+    from inferbench.loadgen import LoadError, read_results
+    from inferbench.metrics import run_metrics
+    from inferbench.report import as_markdown, as_text
+
+    runs = []
+    for path in args.files:
+        try:
+            runs.append(run_metrics(read_results(path), path.stem))
+        except FileNotFoundError:
+            print(f"ibench: {path}: no such file", file=sys.stderr)
+            return EXIT_MODEL
+        except (LoadError, ValueError, KeyError, TypeError) as exc:
+            print(f"ibench: {path} can't be read as results ({exc})", file=sys.stderr)
+            return EXIT_MODEL
+    sys.stdout.write(as_markdown(runs) if args.format == "markdown" else as_text(runs))
+    return EXIT_OK
+
+
+def coldstart_command(args) -> int:
+    import json
+
+    from inferbench.coldstart import ColdStartError, measure
+
+    print(f"starting {args.trials} fresh {args.model} servers, one at a time ...", flush=True)
+    try:
+        result = measure(args.model, args.models_dir, trials=args.trials)
+    except ColdStartError as exc:
+        print(f"ibench: {exc}", file=sys.stderr)
+        return EXIT_MODEL
+    print(f"{'trial':>5}  {'startup s':>9}  {'first ms':>8}  {'steady ms':>9}")
+    for i, t in enumerate(result["results"], 1):
+        print(f"{i:>5}  {t['startup_s']:>9.3f}  {t['first_ms']:>8.2f}  {t['steady_ms']:>9.2f}")
+    m = result["median"]
+    print(f"{'median':>6} {m['startup_s']:>9.3f}  {m['first_ms']:>8.2f}  {m['steady_ms']:>9.2f}")
+    print(f"the first request took {m['first_ms'] / m['steady_ms']:.1f}x as long as a typical one "
+          f"(steady = median of the next {result['steady_requests']})")
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        print(f"saved to {args.output}")
+    return EXIT_OK
 
 
 def run_load_command(args) -> int:
@@ -95,6 +151,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "load":
         return run_load_command(args)
+    if args.command == "report":
+        return report_command(args)
+    if args.command == "coldstart":
+        return coldstart_command(args)
     if args.command == "train":
         if unknown := [n for n in args.names if n not in DIGITS_MODELS]:
             parser.error(f"unknown model {', '.join(unknown)}; choose from {', '.join(DIGITS_MODELS)}")

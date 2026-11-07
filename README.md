@@ -24,3 +24,13 @@ which only waits for a set time and says so, is there for controlled experiments
 
 `ibench load` sends real held-out digit images from several concurrent workers, checks every
 answer, and writes every request (failures included) to a file in `results/`.
+
+```bash
+ibench report results/*.jsonl
+ibench coldstart --model digits-large
+```
+
+`ibench report` compares runs in one table: throughput, p50/p95/p99 latency (only when there are
+enough requests to support them), and how each request's time splits between waiting, the model,
+and everything else. `ibench coldstart` starts fresh servers and times their startup and first
+request.

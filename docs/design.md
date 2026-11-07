@@ -117,8 +117,10 @@ grants no CORS, caps request size, and validates every input strictly. No secret
   server starts) is measured separately.
 - **Every request is kept,** including failures and timeouts. Throughput counts successes, and
   the error rate is always shown next to it.
-- **Percentiles need samples:** p99 is shown only with at least 1,000 successful requests and p95
-  with at least 200; otherwise the report says "not enough samples".
+- **Percentiles need samples:** a percentile is shown only when at least 10 measurements lie
+  beyond it: 20 successful requests for p50, 200 for p95, 1,000 for p99. Otherwise the report
+  shows `n<200` (and so on) instead of a number. Percentiles are nearest-rank, so each one is a
+  latency some request really had.
 - **Hardware and software** are recorded with every run. Client and server share the machine,
   which is a limitation the report states.
 
@@ -140,7 +142,7 @@ README.
 1. Models and the server: training, the digits models and the synthetic model, `/v1/predict`,
    validation, tests including a real server. *(complete)*
 2. Load generator: concurrent workers, per-request records, warmup, results files. *(complete)*
-3. Metrics and report: percentiles with sample-size rules, cold start, hardware, comparison.
+3. Metrics and report: percentiles with sample-size rules, cold start, hardware, comparison. *(complete)*
 4. Batching experiment: a dynamic batcher in the server and the experiment across concurrency.
 5. Overload and failure: a bounded queue (503), client timeouts, injected server errors.
 6. Methodology write-up, README, resume material.
