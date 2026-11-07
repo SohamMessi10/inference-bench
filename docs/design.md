@@ -143,6 +143,7 @@ README.
    validation, tests including a real server. *(complete)*
 2. Load generator: concurrent workers, per-request records, warmup, results files. *(complete)*
 3. Metrics and report: percentiles with sample-size rules, cold start, hardware, comparison. *(complete)*
-4. Batching experiment: a dynamic batcher in the server and the experiment across concurrency.
+4. Batching experiment: a dynamic batcher in the server and the experiment across concurrency. *(complete:
+   results in [`batching.md`](batching.md))*
 5. Overload and failure: a bounded queue (503), client timeouts, injected server errors.
 6. Methodology write-up, README, resume material.

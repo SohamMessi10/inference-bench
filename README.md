@@ -34,3 +34,11 @@ ibench coldstart --model digits-large
 enough requests to support them), and how each request's time splits between waiting, the model,
 and everything else. `ibench coldstart` starts fresh servers and times their startup and first
 request.
+
+```bash
+ibench experiment batching --model digits-large
+```
+
+runs the whole batching experiment: the same load with and without dynamic batching, at 1, 4, 16
+and 64 workers, with a report. Results from three runs are in [`docs/batching.md`](docs/batching.md):
+batching cost about 40% of throughput with one worker and added 74–105% with 64.

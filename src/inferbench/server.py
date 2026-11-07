@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from inferbench.batcher import BatchSettings, DynamicBatcher
 from inferbench.models import INPUT_SIZE, PIXEL_MAX, Model
 
 LOCAL_HOSTS = ["localhost", "127.0.0.1"]
@@ -45,20 +46,32 @@ class PredictRequest(BaseModel):
     inputs: Annotated[list[Image], Field(min_length=1, max_length=MAX_IMAGES)]
 
 
-def create_app(model: Model, *, threads: int = DEFAULT_THREADS, allowed_hosts: list[str] | None = None) -> FastAPI:
-    """`threads` is how many requests can run the model at once; the rest wait their turn.
+def create_app(model: Model, *, threads: int = DEFAULT_THREADS, batching: BatchSettings | None = None,
+               allowed_hosts: list[str] | None = None) -> FastAPI:
+    """`threads` is how many model calls can run at once; the rest wait their turn.
 
     FastAPI runs a plain `def` endpoint in a worker thread from anyio's pool, which allows 40
     at a time unless told otherwise. A benchmark has to state this number, so it is set here
     explicitly and reported by /v1/model, rather than left as a library default.
+
+    With `batching`, requests are grouped by a DynamicBatcher with `threads` batch workers, so
+    both modes allow the same number of model calls at once.
     """
     if not 1 <= threads <= 64:
         raise ValueError(f"threads must be between 1 and 64, got {threads}")
+    batcher = None
+    if batching is not None:
+        batching = BatchSettings(batching.max_images, batching.max_wait_ms, workers=threads)
+        batcher = DynamicBatcher(model, batching)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         anyio.to_thread.current_default_thread_limiter().total_tokens = threads
+        if batcher:
+            await batcher.start()
         yield
+        if batcher:
+            await batcher.stop()
 
     app = FastAPI(title="Inference Bench model server", version="0.1.0", lifespan=lifespan,
                   description=f"Serving {model.info.name} ({model.info.kind}).")
@@ -95,7 +108,35 @@ def create_app(model: Model, *, threads: int = DEFAULT_THREADS, allowed_hosts: l
 
     @app.get("/v1/model")
     def model_info() -> dict:
-        return model.info.to_json() | {"server": {"threads": threads, "max_images": MAX_IMAGES}}
+        server = {"threads": threads, "max_images": MAX_IMAGES, "batching": None}
+        if batching:
+            server["batching"] = {"max_images": batching.max_images, "max_wait_ms": batching.max_wait_ms,
+                                  "workers": batching.workers}
+        return model.info.to_json() | {"server": server}
+
+    if batcher:
+        app.state.batcher = batcher
+
+        # async: the request waits for its batch without holding a worker thread.
+        @app.post("/v1/predict")
+        async def predict_batched(body: PredictRequest, request: Request) -> dict:
+            images = np.asarray(body.inputs, dtype=np.float32)
+            joined = time.perf_counter()
+            result = await batcher.predict(images)
+            return {
+                "model": model.info.name,
+                "predictions": result.predictions,
+                "timing": {
+                    # Reading and validating the body, then waiting for others to join the batch
+                    # and for a batch worker to be free.
+                    "queue_ms": round((joined - request.state.received) * 1000 + result.queue_ms, 3),
+                    "inference_ms": round(result.inference_ms, 3),
+                    "batch_size": result.batch_images,
+                    "batch_requests": result.batch_requests,
+                },
+            }
+
+        return app
 
     # A plain `def`: FastAPI runs it in a worker thread, so a slow model doesn't stall the server.
     @app.post("/v1/predict")

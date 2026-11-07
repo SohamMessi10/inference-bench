@@ -44,6 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="this computer only: the server has no accounts")
     serve.add_argument("--threads", type=int, default=4,
                        help="how many requests can run the model at once (1 to 64; default 4)")
+    serve.add_argument("--batch", action="store_true",
+                       help="group requests that arrive close together into one model call")
+    serve.add_argument("--batch-max-images", type=int, default=64, help="largest batch, in images (default 64)")
+    serve.add_argument("--batch-wait-ms", type=float, default=2.0,
+                       help="longest a request waits for others to join its batch (default 2)")
     serve.add_argument("--fixed-ms", type=float, default=5.0, help="synthetic model: cost per call")
     serve.add_argument("--per-item-ms", type=float, default=0.5, help="synthetic model: cost per input")
 
@@ -71,7 +76,48 @@ def build_parser() -> argparse.ArgumentParser:
     cold.add_argument("--models-dir", type=Path, default=DEFAULT_MODELS_DIR)
     cold.add_argument("--trials", type=int, default=5, help="fresh servers to start (default 5)")
     cold.add_argument("-o", "--output", type=Path, help="also save the results as JSON")
+
+    exp = commands.add_parser("experiment", help="run a whole experiment: servers, load, and report")
+    exp.add_argument("name", choices=["batching"], help="batching: the same load with and without batching")
+    exp.add_argument("--model", default="digits-large", choices=[*DIGITS_MODELS, "synthetic"])
+    exp.add_argument("--models-dir", type=Path, default=DEFAULT_MODELS_DIR)
+    exp.add_argument("--concurrency", default="1,4,16,64", help="worker counts, comma separated (default 1,4,16,64)")
+    exp.add_argument("--duration", type=float, default=5.0, help="measured seconds per run (default 5)")
+    exp.add_argument("--warmup", type=float, default=1.0, help="warmup seconds per run (default 1)")
+    exp.add_argument("--images", type=int, default=1, help="images per request (default 1)")
+    exp.add_argument("--threads", type=int, default=4, help="model threads, the same in both modes (default 4)")
+    exp.add_argument("--batch-wait-ms", type=float, default=2.0)
+    exp.add_argument("--batch-max-images", type=int, default=64)
+    exp.add_argument("--fixed-ms", type=float, default=5.0, help="synthetic model: cost per call")
+    exp.add_argument("--per-item-ms", type=float, default=0.5, help="synthetic model: cost per input")
+    exp.add_argument("-o", "--output", type=Path, help="folder for the results (default: results/batching-...)")
     return parser
+
+
+def experiment_command(args, parser) -> int:
+    from inferbench.experiment import ExperimentConfig, comparison_rows, conclusion, run_experiment
+    from inferbench.procs import ServerStartError
+
+    try:
+        levels = tuple(int(part) for part in args.concurrency.split(","))
+    except ValueError:
+        parser.error(f"--concurrency must be whole numbers separated by commas, got {args.concurrency!r}")
+    config = ExperimentConfig(args.model, levels, args.duration, args.warmup, args.images, args.threads,
+                              args.batch_wait_ms, args.batch_max_images, args.fixed_ms, args.per_item_ms)
+    runs = 2 * len(levels)
+    print(f"{runs} runs of {args.warmup:g} + {args.duration:g} s, about {runs * (args.warmup + args.duration) + 5:.0f} s "
+          f"in all", flush=True)
+    try:
+        out_dir, results = run_experiment(config, args.models_dir, args.output,
+                                          progress=lambda line: print(f"  {line}", flush=True))
+    except (ValueError, ServerStartError) as exc:
+        print(f"ibench: {exc}", file=sys.stderr)
+        return EXIT_MODEL
+    print()
+    for line in conclusion(comparison_rows(results)):
+        print(f"- {line}")
+    print(f"report: {out_dir / 'report.md'}; every request: {out_dir}/*.jsonl")
+    return EXIT_OK
 
 
 def report_command(args) -> int:
@@ -155,6 +201,8 @@ def main(argv: list[str] | None = None) -> int:
         return report_command(args)
     if args.command == "coldstart":
         return coldstart_command(args)
+    if args.command == "experiment":
+        return experiment_command(args, parser)
     if args.command == "train":
         if unknown := [n for n in args.names if n not in DIGITS_MODELS]:
             parser.error(f"unknown model {', '.join(unknown)}; choose from {', '.join(DIGITS_MODELS)}")
@@ -183,9 +231,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if not 1 <= args.threads <= 64:
         parser.error(f"--threads must be between 1 and 64, got {args.threads}")
+    from inferbench.batcher import BatchSettings
+
+    batching = None
+    if args.batch:
+        batching = BatchSettings(args.batch_max_images, args.batch_wait_ms, workers=args.threads)
+        try:
+            batching.check()
+        except ValueError as exc:
+            parser.error(str(exc))
+    mode = f"batching up to {batching.max_images} images or {batching.max_wait_ms:g} ms" if batching else "no batching"
     print(f"serving {model.info.name} ({model.info.kind}) on http://{args.host}:{args.port} with "
-          f"{args.threads} model threads; Ctrl+C to stop", flush=True)
-    uvicorn.run(create_app(model, threads=args.threads), host=args.host, port=args.port,
+          f"{args.threads} model threads, {mode}; Ctrl+C to stop", flush=True)
+    uvicorn.run(create_app(model, threads=args.threads, batching=batching), host=args.host, port=args.port,
                 log_level="warning", access_log=False)
     return EXIT_OK
 

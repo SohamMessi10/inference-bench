@@ -13,11 +13,7 @@ warm for a while. This is the number a user hits after a deploy or a restart.
 from __future__ import annotations
 
 import json
-import socket
 import statistics
-import subprocess
-import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -26,6 +22,7 @@ from pathlib import Path
 
 from inferbench.loadgen import machine_info
 from inferbench.models import DIGITS_MODELS, load_digits_split
+from inferbench.procs import ServerProcess, ServerStartError
 
 
 class ColdStartError(RuntimeError):
@@ -37,12 +34,6 @@ class Trial:
     startup_s: float
     first_ms: float
     steady_ms: float
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _post(url: str, body: bytes, timeout: float) -> float:
@@ -57,43 +48,16 @@ def _post(url: str, body: bytes, timeout: float) -> float:
 
 def one_trial(model: str, models_dir: Path, steady_requests: int = 20, timeout: float = 60.0,
               server_args: tuple[str, ...] = ()) -> Trial:
-    port = _free_port()
-    base = f"http://127.0.0.1:{port}"
     body = json.dumps({"inputs": [load_digits_split()[1][0].tolist()]}).encode()
-    # The server's error output goes to a temporary file, not a pipe: nobody reads a pipe while
-    # the server runs, so a talkative server could fill it and freeze mid-measurement. (The
-    # pipe was also never closed; running the tests with warnings as errors caught that.)
-    log = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
-    started = time.perf_counter()
-    proc = subprocess.Popen([sys.executable, "-m", "inferbench.cli", "serve", "--model", model,
-                             "--models-dir", str(models_dir), "--port", str(port), *server_args],
-                            stdout=subprocess.DEVNULL, stderr=log)
     try:
-        while True:
-            try:
-                urllib.request.urlopen(f"{base}/health", timeout=1).close()
-                break
-            except OSError:
-                if proc.poll() is not None:
-                    log.seek(0)
-                    raise ColdStartError(f"the server exited: {log.read().strip()[-500:]}") from None
-                if time.perf_counter() - started > timeout:
-                    raise ColdStartError(f"the server didn't answer within {timeout:g} s") from None
-                time.sleep(0.005)
-        startup_s = time.perf_counter() - started
-        first_ms = _post(f"{base}/v1/predict", body, timeout)
-        steady = [_post(f"{base}/v1/predict", body, timeout) for _ in range(steady_requests)]
+        with ServerProcess("--model", model, *server_args, models_dir=models_dir, timeout=timeout) as server:
+            first_ms = _post(f"{server.url}/v1/predict", body, timeout)
+            steady = [_post(f"{server.url}/v1/predict", body, timeout) for _ in range(steady_requests)]
+    except ServerStartError as exc:
+        raise ColdStartError(str(exc)) from None
     except (urllib.error.URLError, OSError) as exc:
         raise ColdStartError(f"a request to the new server failed: {exc}") from None
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=10)
-        log.close()
-    return Trial(startup_s, first_ms, statistics.median(steady))
+    return Trial(server.startup_s, first_ms, statistics.median(steady))
 
 
 def measure(model: str, models_dir: Path, trials: int = 5, steady_requests: int = 20) -> dict:

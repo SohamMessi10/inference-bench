@@ -41,7 +41,7 @@ def test_model_info_and_health(client):
     info = client.get("/v1/model").json()
     assert (info["name"], info["kind"], info["input_size"]) == ("digits-small", "real", 64)
     assert info["details"]["test_accuracy"] >= 0.95
-    assert info["server"] == {"threads": 4, "max_images": 64}
+    assert info["server"] == {"threads": 4, "max_images": 64, "batching": None}
     assert client.get("/health").json() == {"status": "ok"}
 
 

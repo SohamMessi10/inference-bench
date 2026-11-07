@@ -2,7 +2,7 @@
 
 ## Status
 
-Milestone 3 of 6 complete: metrics, cold start, and the report. The batching experiment comes next.
+Milestone 4 of 6 complete: the batching experiment. Overload and failure handling come next.
 The full plan is in [`docs/design.md`](docs/design.md).
 
 ## Milestones
@@ -110,6 +110,33 @@ The full plan is in [`docs/design.md`](docs/design.md).
   image, unexplained gaps, unflagged mixed machines, unreported failures, the first request
   ignored). All 11 were caught.
 
+### Milestone 4: the batching experiment
+- `batcher.py`: a dynamic batcher. A batch worker takes the first waiting request and collects
+  more until the batch holds 64 images or 2 ms have passed since that first request; a request
+  is never split, and one that doesn't fit starts the next batch. Each request gets back exactly
+  its own answers, its wait, and the batch's size. A model error fails every request in that
+  batch with the reason.
+- `ibench serve --batch [--batch-max-images N] [--batch-wait-ms MS]`. With batching, there are as
+  many batch workers as `--threads`, so both modes allow the same number of model calls at once
+  and a comparison measures batching alone. `/v1/model` reports the settings.
+- `procs.py`: one shared way to start and stop a server process (cold start now uses it too).
+- `experiment.py` and `ibench experiment batching`: fresh servers with and without batching,
+  identical load at each concurrency level, every results file kept, and a report whose
+  conclusion sentences are computed from the numbers.
+- Results (`docs/batching.md`): on digits-large, three runs, batching changed throughput by
+  −39 to −42% at 1 worker, −3 to −8% at 4, +32 to +51% at 16, and +74 to +105% at 64, where
+  median latency roughly halved. The synthetic model (5 ms fixed cost per call) gained 2.5× at 64.
+  At 16 workers, batching's p99 was worse in one of the three runs.
+- Tests (23 new): batch contents and limits, every request getting exactly its own answers
+  (Hypothesis, with random sizes, limits and worker counts), waiting limits, parallel workers,
+  model failures, the server with batching (test client and a real process under 16 concurrent
+  clients, checking requests really were combined), the experiment end to end, its conclusions.
+- Mutation-checked: 11 deliberate bugs. Two (a request that didn't fit being lost, and a model
+  error swallowed) made tests hang instead of fail; the batcher tests now have a 10 s limit, so
+  they fail in seconds. Four survived at first (batching ignoring `--threads`, the batch wait
+  missing from `queue_ms`, a wrong conclusion threshold, latencies swapped in the comparison) and
+  are now caught.
+
 ## Commands verified
 
 | Where | Python | Command | Result |
@@ -120,13 +147,14 @@ The full plan is in [`docs/design.md`](docs/design.md).
 | Claude's Linux workspace | 3.13 | `ibench load` at 1, 4 and 16 workers against digits-large | all requests ok |
 | Claude's Linux workspace | 3.12, 3.13, 3.14 | `python -m pytest`, dev and ci profiles | 98 passed (milestone 3) |
 | Claude's Linux workspace | 3.13 | `ibench report` on three runs; `ibench coldstart` on both models | numbers above |
+| Claude's Linux workspace | 3.12, 3.13, 3.14 | `python -m pytest`, dev and ci profiles | 121 passed (milestone 4) |
+| Claude's Linux workspace | 3.13 | `ibench experiment batching`, digits-large ×3 and synthetic ×1 | docs/batching.md |
 
 ## Next
 
-Milestone 4: the batching experiment. A dynamic batcher in the server collects requests that
-arrive close together (up to a size and a wait limit) and runs them through the model as one
-batch. Then one command runs the same load with and without it, across concurrency levels, and
-reports the measured tradeoff, whichever way it goes.
+Milestone 5: overload and failure. A bounded queue so an overloaded server answers 503 at once
+instead of making requests wait without limit, a request deadline, injected model errors, and
+measurements of how the server and the client behave when things go wrong.
 
 ## Concepts to review
 - Why a benchmark must say whether its "model" is real.
@@ -141,3 +169,7 @@ reports the measured tradeoff, whichever way it goes.
 - Where request time really goes: waiting, the model, and everything else.
 - Cold start versus steady state.
 - Floating-point traps in simple arithmetic, and exact fractions.
+- Dynamic batching: the wait-versus-throughput tradeoff, and where the crossover falls.
+- Why fixed cost per call decides how much batching helps (and why GPUs batch).
+- Comparing like with like: same parallelism in both modes.
+- Why one run isn't enough: the same experiment varied by 31 percentage points.

@@ -121,3 +121,26 @@ def test_synthetic_server_reports_the_cost_it_was_given():
             assert json.load(response)["kind"] == "synthetic"
     finally:
         stop(proc)
+
+
+def test_batching_server_under_concurrent_clients(models_dir, digits):
+    base, proc = start("--model", "digits-small", "--models-dir", str(models_dir), "--batch",
+                       "--batch-wait-ms", "5", "--threads", "2")
+    model = load_model("digits-small", models_dir)
+    images = digits[1]
+
+    def client(seed):
+        rng = random.Random(seed)
+        outcomes = []
+        for _ in range(25):
+            picked = images[rng.sample(range(len(images)), rng.randint(1, 8))]
+            status, body = predict(base, picked.tolist())
+            right = body is not None and body["predictions"] == model.predict(picked).tolist()
+            outcomes.append((status, right, body["timing"]["batch_requests"] if body else 0))
+        return outcomes
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = [o for batch in pool.map(client, range(16)) for o in batch]
+    errors = stop(proc)
+    assert Counter((s, r) for s, r, _ in results) == Counter({(200, True): 400}), errors[-2000:]
+    assert max(n for _, _, n in results) > 1  # requests really were combined
